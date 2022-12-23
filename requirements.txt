@@ -1,0 +1,5 @@
+mlxtend==0.21.0
+numpy==1.23.5
+pandarallel==1.6.3
+pandas==1.5.1
+
