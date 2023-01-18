@@ -22,8 +22,9 @@ class SAI(object):
         parallel (bool): run the module in parallel
         params (dict): all the parameters required to instantiate the object
         q (int): quantile for discretization
-        rules (TYPE): output rules and the correspoinding metrics
+        rules (pd.DataFrame): output rules and the correspoinding metrics
         te_ary (object): object that holds the tranformation to fpgrowth input data format
+        verbose (boolean): flag to suppress progress bar and messages
 
     """
 
@@ -40,6 +41,8 @@ class SAI(object):
         """
         self.params = params
         self.q = params.get('q', 2)
+        self.verbose = params.get('verbose', True)
+        progress_bar = True if self.verbose else False
         if self.q < 2:
             raise ValueError(
                 "require to discretize input variables into at least 2 categories; variables that are not discretized into more than one category do not offer additional information")
@@ -50,7 +53,7 @@ class SAI(object):
             self.nb_workers = nb_workers if nb_workers else psutil.cpu_count(
                 logical=False)
             pandarallel.initialize(
-                progress_bar=True, nb_workers=self.nb_workers, verbose=0)
+                progress_bar=progress_bar, nb_workers=self.nb_workers, verbose=0)
 
     def __discretize(self, df: Union[pd.Series, pd.DataFrame], q: int = 3) -> Tuple[pd.DataFrame, dict]:
         """Descretize numeric columns of dataframe into quantile buckets {Name}_1 - {Name}_q;
@@ -201,13 +204,13 @@ class SAI(object):
         """
         if not isinstance(X, pd.DataFrame):
             raise ValueError(
-                "X must be a pandas DataFrame with dimension n x m (i.e. n is number of sercurities and m is the number of variables")
+                "X must be a pandas DataFrame with dimension n x m (i.e. n is number of securities and m is the number of variables")
         if not isinstance(y, pd.DataFrame):
             raise ValueError(
                 "y must be a pandas DataFrame with values as labels {0,1} indentifying whether the security at column n is considered as successful (1)")
         if X.shape[0] != y.shape[0]:
             raise ValueError(
-                "The dimension for both X and y must be the same")
+                "The row dimension for both X and y must be the same")
 
         TrainData = self.__preprocess(X, y, q=self.q)
         te = TransactionEncoder()
@@ -215,9 +218,10 @@ class SAI(object):
         dataset = pd.DataFrame(
             self.te_ary.transform(TrainData), columns=te.columns_)
 
-        print('\n...................................')
-        print('   training Invest-SAI algorithm   ')
-        print('...................................\n')
+        if self.verbose:
+            print('\n...................................')
+            print('   training Invest-SAI algorithm   ')
+            print('...................................\n')
 
         freqitemset = fpgrowth(
             dataset, min_support=0.05, use_colnames=True)
@@ -231,20 +235,29 @@ class SAI(object):
             self.rules = self.rules.loc[self.rules['consequents'].apply(
                 lambda x: x.issubset(['success']))].sort_values('confidence', ascending=False)
 
-        self.rules['odd_ratios'] = self.rules['support'] * (1 - self.rules['antecedent support'] - self.rules['consequent support'] + self.rules['support']) / (
-            (self.rules['consequent support'] - self.rules['support']) * (self.rules['antecedent support'] - self.rules['support']))
+        numerator = self.rules['support'] * (1 - self.rules['antecedent support'] -
+                                             self.rules['consequent support'] + self.rules['support'])
+        denominator = (self.rules['consequent support'] - self.rules['support']) * (
+            self.rules['antecedent support'] - self.rules['support'])
+        mask = denominator != 0
 
-        self.rules = self.rules[['antecedents', 'confidence', 'odd_ratios']]
+        self.rules.loc[mask, 'odd_ratio'] = numerator.loc[mask] / \
+            denominator.loc[mask]
+        self.rules.dropna(inplace=True)
+        self.rules = self.rules[['antecedents',
+                                 'confidence', 'odd_ratio', 'lift']]
         self.rules.rename(columns={'antecedents': 'rules',
-                                   'confidence': 'cond_success_prob'}, inplace=True)
+                                   'confidence': 'cond_success_prob',
+                                   'lift': 'causal_lift'}, inplace=True)
 
-    def predict(self, X: pd.DataFrame, metric: str = 'cond_success_prob') -> pd.DataFrame:
+    def predict(self, X: pd.DataFrame, metric: str = 'cond_success_prob', cutoff: float=0) -> pd.DataFrame:
         """Assign to probabilties to a new set of securities using the learned rules
         equal-weighted the success probabilities of the rules that represent the security
 
         Args:
             X (pd.DataFrame): Input pandas dataframe with each row represent a security
             metric (str, optional): The metric used to rank securities, i.e. support, confidence, lift, leverage, conviction
+            cutoff (float, optional): only consider the rules with metric >= cutoff
 
         Returns:
             pd.DataFrame: a pandas dataframe with the right-most column to rank securities
@@ -254,14 +267,17 @@ class SAI(object):
         """
         if not isinstance(X, pd.DataFrame):
             raise ValueError(
-                "X must be a pd.DataFrame containing the sercurities that users want to rank and the corresopnding variables")
+                "X must be a pd.DataFrame containing the securities that users want to rank and the corresopnding variables")
 
         XTest, _ = self.__discretize_mixed_type(
             df=X, cutpoints=self.cutpoints, disc_func=self.__apply_discretize)
 
-        print('\n....................................')
-        print('            predicting             ')
-        print('...................................\n')
+        rules_filtered = self.rules[self.rules[metric] >= cutoff]
+
+        if self.verbose:
+            print('\n....................................')
+            print('            predicting             ')
+            print('...................................\n')
 
         if self.parallel:
             def avg_probs(s: pd.Series, r: pd.DataFrame) -> float:
@@ -284,14 +300,14 @@ class SAI(object):
                 return prob / cnt if cnt > 0 else np.nan
 
             probs = XTest.parallel_apply(
-                lambda x: avg_probs(x, self.rules), axis=1)
+                lambda x: avg_probs(x, rules_filtered), axis=1)
 
         else:
             XTest = XTest.values.tolist()
             probs = []
             for s in XTest:
-                rules = self.rules[['rules']].apply(
+                rules = rules_filtered[['rules']].apply(
                     lambda r: r[0].issubset(s), axis=1).tolist()
-                probs.append(self.rules.loc[rules, metric].mean())
+                probs.append(rules_filtered.loc[rules, metric].mean())
 
         return pd.DataFrame(probs, columns=['exp_' + metric], index=X.index).sort_values('exp_' + metric, ascending=False)
